@@ -19,12 +19,17 @@ It exposes the same ``create_completion(prompt, stream=...)`` generator API as
 PROTOCOL ASSUMPTIONS (verify at runtime against a live session):
   * Conversation create:  POST /c/api/conversations  -> {"id": "..."}
   * Chat socket:          wss://copilot.microsoft.com/c/api/chat?api-version=2
-                          (with &accessToken=<token> when signed in)
+                          &clientSessionId=<uuid> (with &accessToken=<token> when
+                          signed in)
+  * Preamble:             {"event":"setOptions",...} then
+                          {"event":"reportLocalConsents","grantedConsents":[]}
   * Send frame:           {"event":"send","conversationId":...,
-                           "content":[{"type":"text","text":...}],"mode":"chat"}
-  * Stream frames:        {"event":"appendText","text":...}, then {"event":"done"}
-These mirror the captured protocol in ``client.py``. If Microsoft changes them,
-adjust the JS templates below.
+                           "content":[{"type":"text","text":...}],"mode":"smart",
+                           "context":{}}
+  * Stream frames:        an empty {"event":"challenge","method":null} (ignored),
+                          then {"event":"appendText","text":...} and {"event":"done"}
+These mirror the protocol in ``driver.py`` (re-capture with ``python -m copilot
+capture`` if Microsoft changes it, and adjust the JS templates below).
 """
 
 from __future__ import annotations
@@ -36,7 +41,7 @@ from typing import Dict, Generator, Optional
 
 from playwright.sync_api import sync_playwright, Error as PlaywrightError
 
-from .auth import DEFAULT_AUTH_FILE, DEFAULT_PROFILE_DIR
+from .auth import DEFAULT_AUTH_FILE, DEFAULT_PROFILE_DIR, SESSION_DIR
 
 COPILOT_URL = "https://copilot.microsoft.com/"
 
@@ -95,23 +100,42 @@ _START_STREAM_JS = """
 ([conversationId, accessToken, prompt]) => {
   const state = {queue: [], done: false, error: null, started: false};
   window.__copilot = state;
-  let url = 'wss://copilot.microsoft.com/c/api/chat?api-version=2';
+  // Mirror the live web client's handshake (captured via `python -m copilot
+  // capture`): a per-session clientSessionId, a setOptions/reportLocalConsents
+  // preamble, then the send frame with mode 'smart'.
+  const clientSessionId = (crypto.randomUUID ? crypto.randomUUID() :
+    'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, c => {
+      const r = Math.random() * 16 | 0; return (c === 'x' ? r : (r & 0x3 | 0x8)).toString(16);
+    }));
+  let url = 'wss://copilot.microsoft.com/c/api/chat?api-version=2&clientSessionId=' + clientSessionId;
   if (accessToken) url += '&accessToken=' + encodeURIComponent(accessToken);
   let ws;
   try { ws = new WebSocket(url); } catch (e) { state.error = 'ws-init: ' + e; state.done = true; return false; }
   window.__copilotWs = ws;
   ws.onopen = () => {
     ws.send(JSON.stringify({
+      event: 'setOptions',
+      supportedFeatures: ['partial-generated-images', 'composer-prefill-conversation-action',
+        'composer-send-conversation-action-v2', 'side-by-side-comparison',
+        'session-duration-nudge', 'compose-email-html'],
+      supportedCards: [],
+      supportedActions: []
+    }));
+    ws.send(JSON.stringify({event: 'reportLocalConsents', grantedConsents: []}));
+    ws.send(JSON.stringify({
       event: 'send',
       conversationId: conversationId,
       content: [{type: 'text', text: prompt}],
-      mode: 'chat'
+      mode: 'smart',
+      context: {}
     }));
   };
   ws.onmessage = (ev) => {
     let msg;
     try { msg = JSON.parse(ev.data); } catch (e) { return; }
     const e = msg.event;
+    // An empty challenge (method/parameter null) is informational and ignored;
+    // only appendText/done/error matter here.
     if (e === 'appendText') { state.started = true; if (msg.text) state.queue.push(msg.text); }
     else if (e === 'done') { state.done = true; try { ws.close(); } catch (x) {} }
     else if (e === 'error') { state.error = JSON.stringify(msg); state.done = true; try { ws.close(); } catch (x) {} }
@@ -350,6 +374,91 @@ class BrowserCopilot:
             raise ConnectionError(f"WebSocket failed to start: {state.get('error')}")
 
         yield from self._pump(timeout)
+
+    # -- protocol capture ---------------------------------------------------
+
+    def capture_protocol(
+        self,
+        out_path: str = f"{SESSION_DIR}/protocol_capture.json",
+        wait: int = 180,
+    ) -> str:
+        """Record the *real* Copilot site's chat WebSocket traffic to ``out_path``.
+
+        Opens copilot.microsoft.com in a visible window and taps every WebSocket
+        via Playwright's ``framesent``/``framereceived`` events. Send one message
+        in the genuine UI and let the reply finish; the capture auto-saves once a
+        chat socket reports ``done`` (or after ``wait`` seconds), writing each
+        socket's URL and ordered frames to ``out_path`` as JSON.
+
+        This captures the authoritative current protocol (query params, the
+        ``setOptions``/``reportLocalConsents`` preamble, the ``send`` frame's
+        ``mode``, and the stream events) so the headless
+        :class:`~copilot.driver.Copilot` can be kept in sync. Sign in first
+        (``python -m copilot login``) for a realistic signed-in capture, and on a
+        brand-new account send at least one message manually beforehand to clear
+        Copilot's onboarding/consent (until then the backend withholds replies).
+        Any ``accessToken``/``access_token`` query param is redacted, but the file
+        may still contain conversation text — it lives under the git-ignored
+        ``session/`` folder.
+
+        Note: we poll ``page.wait_for_timeout`` rather than blocking on ``input()``
+        because Playwright's sync event loop only dispatches the frame callbacks
+        while the main thread is inside a Playwright call — a bare ``input()``
+        would starve it and capture nothing.
+        """
+        self._ensure_started()
+        sockets: list = []
+
+        def on_ws(ws) -> None:
+            record = {"url": self._scrub_token(ws.url), "frames": []}
+            sockets.append(record)
+            ws.on("framesent",
+                  lambda payload: record["frames"].append({"dir": "sent", "payload": self._frame_text(payload)}))
+            ws.on("framereceived",
+                  lambda payload: record["frames"].append({"dir": "recv", "payload": self._frame_text(payload)}))
+
+        self._page.on("websocket", on_ws)
+        print(
+            "\nA browser window is open at copilot.microsoft.com.\n"
+            "Type a short message in the real Copilot UI and send it, then wait —\n"
+            f"the capture saves automatically when the reply finishes (or after {wait}s)."
+        )
+
+        def chat_done() -> bool:
+            return any(
+                '"event":"done"' in f["payload"]
+                for s in sockets if "/c/api/chat" in s["url"]
+                for f in s["frames"] if f["dir"] == "recv"
+            )
+
+        deadline = time.time() + wait
+        while time.time() < deadline:
+            self._page.wait_for_timeout(500)  # pumps Playwright events
+            if chat_done():
+                self._page.wait_for_timeout(800)  # flush trailing frames
+                break
+
+        dest = Path(out_path)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_text(json.dumps(sockets, indent=2), encoding="utf-8")
+        total = sum(len(s["frames"]) for s in sockets)
+        print(f"Captured {total} frame(s) from {len(sockets)} socket(s) to {out_path}")
+        self.close()
+        return out_path
+
+    @staticmethod
+    def _scrub_token(url: str) -> str:
+        """Redact the ``accessToken`` query value so captures aren't secret-bearing."""
+        import re
+
+        return re.sub(r"(accessToken=)[^&]*", r"\1REDACTED", url or "")
+
+    @staticmethod
+    def _frame_text(payload) -> str:
+        """Normalise a Playwright WS frame payload (str or bytes) to text."""
+        if isinstance(payload, (bytes, bytearray)):
+            return payload.decode("utf-8", errors="replace")
+        return payload
 
     # -- internals ----------------------------------------------------------
 

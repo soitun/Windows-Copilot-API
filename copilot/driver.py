@@ -8,6 +8,7 @@ See :mod:`copilot.browser` for the Playwright-backed fallback.
 
 import json
 import time
+import uuid
 from select import select
 from typing import Dict, Optional
 from urllib.parse import quote
@@ -35,6 +36,44 @@ class Copilot(AbstractProvider):
     needs_auth = False  # consumer chat works anonymously (cookies only)
     websocket_url = "wss://copilot.microsoft.com/c/api/chat?api-version=2"
     conversation_url = f"{url}/c/api/conversations"
+
+    # Handshake preamble the live copilot.microsoft.com client sends on the chat
+    # socket *before* the first message (captured via `python -m copilot
+    # capture`). The backend stays silent until it sees these, so the old bare
+    # `send`-only handshake hung forever (issue #1). Kept verbatim so server-side
+    # feature negotiation matches the real web client.
+    set_options_frame = {
+        "event": "setOptions",
+        "supportedFeatures": [
+            "partial-generated-images",
+            "composer-prefill-conversation-action",
+            "composer-send-conversation-action-v2",
+            "side-by-side-comparison",
+            "session-duration-nudge",
+            "compose-email-html",
+        ],
+        "supportedCards": [
+            "weather", "local", "image", "sports", "video", "healthcareEntity",
+            "healthcareInfo", "healthRecordsConnectNewProvider", "healthRecordsUpdate",
+            "suggestHealth", "chart", "ads", "safetyHelpline", "quiz", "finance",
+            "recipe", "personalArtifacts", "flashcard", "navigation", "person",
+            "powerPointCreator", "consentV2", "composeEmail", "createCalendarEvent",
+            "modifyCalendarEvent", "deleteCalendarEvent", "practiceTest", "tapToReveal",
+        ],
+        "supportedUIComponents": {
+            "Badge": "1.2", "Basic": "1.2", "Box": "1.2", "Button": "1.2",
+            "Card": "1.2", "Caption": "1.2", "Chart": "1.2", "Checkbox": "1.2",
+            "Col": "1.2", "DatePicker": "1.3", "Divider": "1.2", "Form": "1.2",
+            "Icon": "1.2", "Image": "1.2", "Label": "1.2", "ListView": "1.2",
+            "ListViewItem": "1.2", "Map": "1.3", "Markdown": "1.2", "Pressable": "1.3",
+            "RadioGroup": "1.3", "Row": "1.2", "Select": "1.3", "Spacer": "1.2",
+            "Table": "1.3", "Table.Cell": "1.3", "Table.Row": "1.3", "Text": "1.2",
+            "Textarea": "1.3", "Title": "1.2", "Transition": "1.2",
+        },
+        "ads": {"supportedTypes": ["text", "product", "multimedia", "tourActivity", "propertyPromotion"]},
+        "supportedActions": [],
+    }
+    report_consents_frame = {"event": "reportLocalConsents", "grantedConsents": []}
 
     def create_completion(
             self,
@@ -87,7 +126,9 @@ class Copilot(AbstractProvider):
         #     wrong-audience token 401s the WS upgrade, while *no* token makes the
         #     chat backend treat the session as anonymous -> chat-service-
         #     unavailable in geo-restricted regions (e.g. India).
-        websocket_url = self.websocket_url
+        # The live web client tags the socket with a per-session clientSessionId
+        # (a fresh UUID); mirror it so the handshake matches.
+        websocket_url = f"{self.websocket_url}&clientSessionId={uuid.uuid4()}"
         if access_token:
             websocket_url = f"{websocket_url}&accessToken={quote(access_token)}"
 
@@ -126,12 +167,25 @@ class Copilot(AbstractProvider):
                 "event": "send",
                 "conversationId": conversation_id,
                 "content": [*images, {"type": "text", "text": prompt}],
-                "mode": "chat",
+                "mode": "smart",
+                "context": {},
             }).encode()
 
             wss = session.ws_connect(websocket_url)
-            wss.send(send_frame, CurlWsFlag.TEXT)
-            yield from self._read_stream(wss, send_frame, timeout)
+            try:
+                # Negotiate features, then send. The live client emits all three
+                # frames up front (setOptions -> reportLocalConsents -> send).
+                wss.send(json.dumps(self.set_options_frame).encode(), CurlWsFlag.TEXT)
+                wss.send(json.dumps(self.report_consents_frame).encode(), CurlWsFlag.TEXT)
+                wss.send(send_frame, CurlWsFlag.TEXT)
+                yield from self._read_stream(wss, send_frame, timeout)
+            finally:
+                # Always tear the socket down so an aborted/errored stream
+                # doesn't leave a dangling WS_RECV (curl error 81) behind.
+                try:
+                    wss.close()
+                except Exception:
+                    pass
 
     def _read_stream(self, wss, send_frame: bytes, timeout: int, idle_timeout: int = 60):
         """Consume chat-socket frames, solving challenges, yielding text/images.
@@ -168,6 +222,14 @@ class Copilot(AbstractProvider):
                 last_msg = msg
                 event = msg.get("event")
                 if event == "challenge" and not answered:
+                    # The current protocol opens with an empty challenge
+                    # (method/parameter both null) that the real web client simply
+                    # ignores — it is not a proof-of-work request (answering it
+                    # returns error:invalid-event). Only a challenge carrying an
+                    # actual method needs a response.
+                    if not msg.get("method") and not msg.get("parameter"):
+                        answered = True
+                        continue
                     token = self._solve_challenge(msg)
                     if token is None:
                         raise RuntimeError(
@@ -238,17 +300,14 @@ class Copilot(AbstractProvider):
     def _solve_challenge(msg: dict):
         """Return the challenge-response token, or ``None`` if we can't solve it.
 
-        Copilot's chat socket precedes the answer with a challenge frame that the
-        client must acknowledge. An *empty* challenge (no ``method``/``parameter``)
-        only needs an acknowledging response, so we return an empty token; the
-        proof-of-work variants are computed in :mod:`copilot.challenges`. A
-        ``None`` return means the challenge needs a browser-solved token (e.g. a
-        Cloudflare Turnstile) and the caller should surface that.
+        Only proof-of-work challenges reach here (empty challenges are ignored by
+        the caller). The ``hashcash``/``copilot`` variants are computed in
+        :mod:`copilot.challenges`; a ``None`` return means the challenge needs a
+        browser-solved token (e.g. a Cloudflare Turnstile) and the caller should
+        surface that.
         """
         method = msg.get("method")
         parameter = msg.get("parameter")
-        if not method and not parameter:
-            return ""  # empty/no-op challenge: just acknowledge it
         if method == "hashcash" and parameter:
             return solve_hashcash(parameter)
         if method == "copilot" and parameter:

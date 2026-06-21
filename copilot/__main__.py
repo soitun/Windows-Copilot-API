@@ -2,6 +2,7 @@
 
     python -m copilot login        # interactive sign-in, persists the session
     python -m copilot ask "hi"     # one-shot completion via the browser driver
+    python -m copilot capture      # record the live chat WebSocket protocol
 """
 
 import sys
@@ -21,7 +22,12 @@ def main(argv) -> int:
                 print(chunk, end="", flush=True)
             print()
         return 0
-    print(f"Unknown command: {cmd!r}. Use 'login' or 'ask <prompt>'.")
+    if cmd == "capture":
+        out = argv[1] if len(argv) > 1 else None
+        bot = BrowserCopilot(headless=False)
+        bot.capture_protocol(out) if out else bot.capture_protocol()
+        return 0
+    print(f"Unknown command: {cmd!r}. Use 'login', 'ask <prompt>', or 'capture'.")
     return 2
 
 
