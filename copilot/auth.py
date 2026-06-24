@@ -55,10 +55,13 @@ def load_auth(
     from .browser import BrowserCopilot
 
     # Try a headless read first: a signed-in profile just needs a fresh token.
+    # For encrypted-cache sessions (e.g. Google) the token can't be read from
+    # storage, so acquire_chat_token warms up one turn to capture it off the chat
+    # socket; Microsoft sessions return their cached token instantly (no warm-up).
     bot = BrowserCopilot(profile_dir=profile_dir, headless=True, proxy=proxy)
     try:
         bot.start()
-        token = bot.access_token()
+        token = bot.acquire_chat_token()
         if token and not bot.region_blocked():
             return bot.export_auth(path=path, stamp=time.time())
     finally:

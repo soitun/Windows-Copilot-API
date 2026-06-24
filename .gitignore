@@ -8,7 +8,6 @@ venv/
 # clearance, sign-in) + cached auth token. Secret.
 session/
 docs/
-Windows-Copilot-API
 
 # Local config / secrets
 config.json

@@ -11,7 +11,7 @@ You can use it in two ways:
 - 🐍 **As a Python library:** just call `client.chat("Hi")`. Supports streaming and multi-turn conversations.
 - 🔌 **As a local OpenAI-compatible API:** runs a server at `http://localhost:8000/v1` that speaks the OpenAI format, so the official `openai` SDK (and any OpenAI-compatible app) works as a drop-in, with `localhost` in place of OpenAI.
 
-You sign in once with your Microsoft account in a browser; your session is saved and refreshed automatically after that.
+You sign in once in a browser with your Microsoft **or Google** account; your session is saved and refreshed automatically after that.
 
 > **Unofficial project.** Not affiliated with or endorsed by Microsoft. It automates the consumer Copilot web experience for personal use, so use it responsibly and within Microsoft's terms.
 
@@ -88,13 +88,11 @@ pip install -r requirements.txt
 # Install the browser Playwright needs (one-time)
 playwright install chromium
 
-# Sign in once: a browser opens, log into your Microsoft account
+# Sign in once: a browser opens, log into your Microsoft or Google account
 python -m copilot login
 ```
 
-The browser **closes by itself** once sign-in is detected — you don't need to press Enter or close it manually. The steps are logged to `session/login.log` if anything goes wrong. That's it: your session is saved under `session/` (git-ignored, never shared) and reused on every run.
-
-> 💡 You can even skip step 3: the **first** time you call `chat()` or start the server, it opens the sign-in browser for you automatically.
+The browser **closes by itself** once sign-in is detected — you don't need to press Enter or close it manually. After sign-in it sends one short warm-up message that mints the chat token **and** passes Cloudflare's "verify you're human" check in the same step (a brief "finishing setup…" appears, and a tiny throwaway chat lands in your history). If a checkbox shows up, click it in that login window. The steps are logged to `session/login.log` if anything goes wrong. That's it: your session is saved under `session/` (git-ignored, never shared) and reused on every run — so your first request works right away.
 
 > 🛠️ **Run into trouble during setup or your first run?** Head to the [Troubleshooting](#troubleshooting) section, the bundled diagnostic both *fixes* common issues (captcha/clearance) and *logs* a shareable report.
 
@@ -104,7 +102,7 @@ The browser **closes by itself** once sign-in is detected — you don't need to 
 
 Prefer a container? You can run the OpenAI-compatible server in Docker once you've signed in.
 
-> **Sign in on the host first.** The login step above opens a *visible* browser, which can't run inside the headless container — so run `python -m copilot login` on your host to populate `session/`. The container mounts that folder and only does the automatic (headless) token refresh from then on.
+> **Sign in on the host first.** The login step above opens a *visible* browser, which can't run inside the headless container — so run `python -m copilot login` on your host to populate `session/`. The container mounts that folder and reuses the Cloudflare clearance earned on the host. It refreshes the chat token headlessly, but it can't earn *fresh* clearance without a visible browser, so when clearance expires (~30 min) it returns a `503` — re-run `python -m copilot login` on the host to refresh `session/`.
 
 ```bash
 docker compose up --build
@@ -201,6 +199,30 @@ python -m copilot ask "Hello!"   # quick one-shot question
 
 ---
 
+## Cloudflare clearance (automatic)
+
+Copilot's chat sits behind Cloudflare. Access needs a `cf_clearance` cookie,
+earned by passing a "verify you're human" check in a real browser, and it lasts
+about half an hour. The bridge handles this for you:
+
+- **At sign-in:** `python -m copilot login` earns clearance as part of the same
+  warm-up that mints your token, so your first request works immediately. If
+  Cloudflare shows a checkbox, click it in the login window.
+- **When it expires:** if a later request hits the gate, the bridge opens a
+  browser, passes the check (the checkbox is clicked automatically, or you click
+  it if one appears), and retries the request for you. You'll see a short
+  `[copilot] clearance: …` progress log, then the answer.
+
+On a trusted connection the check often passes invisibly with no window at all. A
+datacenter/VPN IP is stricter and more likely to show the checkbox; a residential
+connection clears most reliably.
+
+The **server** never opens a window: when clearance expires it returns a `503`
+(`type: "clearance_required"`). Re-clear out of band with `python -m copilot
+login`, then retry.
+
+---
+
 ## Concurrency & stress test
 
 The server bridges a **single** signed-in Copilot account, and Copilot's chat
@@ -282,7 +304,7 @@ add a few retries yourself.
 | [copilot/](copilot/) | The core library: `CopilotClient`, auth, browser sign-in, HTTP driver |
 | [server/](server/) | The FastAPI OpenAI-compatible server |
 | [examples/](examples/) | Runnable examples for every feature ([examples/README.md](examples/README.md)) |
-| [tests/](tests/) | Test scripts: the concurrency stress test ([tests/stress.py](tests/stress.py)) and the diagnostic/captcha-fix tool ([tests/diagnostic.py](tests/diagnostic.py)) |
+| [tests/](tests/) | Test scripts: the concurrency stress test ([tests/stress.py](tests/stress.py)) and the diagnostic & report tool ([tests/diagnostic.py](tests/diagnostic.py)) |
 | [app.py](app.py) | Starts the server |
 
 ---
@@ -299,24 +321,25 @@ add a few retries yourself.
 
 ## Troubleshooting
 
-**Hit an error? Run the diagnostic first — it both *fixes* and *logs*.**
+Cloudflare clearance is handled automatically (see above), so most "verify you're
+human" issues clear themselves. If a request still fails, run the diagnostic — it
+refreshes the session and writes a shareable report.
 
 ```bash
-python tests/diagnostic.py                # browser capture + captcha fix + report
+python tests/diagnostic.py                # browser capture + report
 python tests/diagnostic.py --report-only  # headless/VPS: report only, no browser
 ```
 
 The default run opens your signed-in browser and asks you to send one short
-message. That single action does two things:
+message. That single action:
 
-- **Fixes captcha:** it drives a *real* browser on the same `session/profile/`
-  the bridge uses, so passing any "verify you're human" check earns a fresh
-  `cf_clearance` cookie. When the turn completes the tool snapshots that session
-  (cookies + token) into `session/token.json`, so the pure-HTTP driver adopts
-  the clearance immediately.
+- **Refreshes clearance:** it drives a *real* browser on the same
+  `session/profile/` the bridge uses, so passing any "verify you're human" check
+  earns a fresh `cf_clearance` cookie, then snapshots the session (cookies +
+  token) into `session/token.json` for the pure-HTTP driver to adopt.
 - **Captures the protocol** to `session/ws_capture.log`. A clean turn goes
   `setOptions` → `send` → `appendText…` → `done`; a `{"event":"challenge",
-  "method":"cloudflare",…}` frame means Cloudflare gated you (now cleared).
+  "method":"cloudflare",…}` frame means Cloudflare gated the turn.
 
 It also writes `session/diagnostic_report.txt` — environment, the *shape* of your
 session (cookie names + token length, never the values), a live chat probe, and
@@ -325,11 +348,10 @@ OAuth codes, and emails are redacted before anything is written. Attach
 `diagnostic_report.txt` to a GitHub issue (skim it first) and the cause is
 usually obvious.
 
-> On a headless **server/VPS** you can't open the browser, so the captcha fix
-> isn't available there — pass `--report-only`, then do the clearance step on a
-> machine with a display (or route traffic through a residential connection,
-> e.g. a home-PC exit node) since datacenter IPs are where Cloudflare withholds
-> clearance and you see `RuntimeError: Copilot error: invalid-event`.
+> On a headless **server/VPS** you can't open a browser, so clearance can't be
+> earned there — pass `--report-only`, and do the clearance step on a machine
+> with a display (or route traffic through a residential connection, e.g. a
+> home-PC exit node), since datacenter IPs are where Cloudflare is strictest.
 
 ---
 

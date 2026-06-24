@@ -7,6 +7,7 @@ from fastapi import FastAPI
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from copilot import CopilotClient
+from copilot.driver import ClearanceRequired
 
 from .config import MODEL_NAME, RATE_LIMIT_BURST, RATE_LIMIT_RPM
 from .openai_format import (
@@ -20,7 +21,18 @@ from .ratelimit import TokenBucket
 from .schemas import ChatCompletionRequest
 
 app = FastAPI(title="Copilot OpenAI-compatible API", version="1.0.0")
-client = CopilotClient()
+# Server runs headless and must never pop a visible browser mid-request. With
+# both recovery passes disabled, an expired clearance surfaces immediately as a
+# 503 (see ClearanceRequired handling below) so an operator can re-clear out of
+# band (`python -m copilot login`). Headless auto-solve is intentionally off:
+# it's unreliable on low-trust egress and a failed pass can wedge the session.
+client = CopilotClient(interactive_clear=False, headless_clear=False)
+
+_CLEARANCE_HELP = (
+    "Cloudflare clearance expired and could not be refreshed headlessly. "
+    "Re-clear in a browser: run `python -m copilot login` (or `python tests/diagnostic.py`) "
+    "and pass the 'verify you're human' check, then retry."
+)
 
 # Self-imposed rate limit on top of the concurrency lock below: this caps
 # requests-per-minute, the lock caps requests-in-flight. See server/ratelimit.py.
@@ -77,6 +89,10 @@ def _stream(prompt: str, model: str, conversation_id=None):
                     conversation_id=stream.conversation_id,
                 )
             )
+    except ClearanceRequired:
+        yield sse_event(
+            stream_chunk(cid, created, model, {"content": f"\n[error: {_CLEARANCE_HELP}]"}, finish="error")
+        )
     except Exception as exc:  # surface errors to the client instead of hanging
         yield sse_event(
             stream_chunk(cid, created, model, {"content": f"\n[error: {exc}]"}, finish="error")
@@ -118,6 +134,11 @@ def chat_completions(req: ChatCompletionRequest):
     try:
         with _upstream_lock:  # serialize: one upstream chat at a time
             reply = client.chat(prompt, conversation_id=req.conversation_id)
+    except ClearanceRequired:
+        return JSONResponse(
+            status_code=503,
+            content={"error": {"message": _CLEARANCE_HELP, "type": "clearance_required"}},
+        )
     except Exception as exc:
         return JSONResponse(
             status_code=502,

@@ -28,6 +28,20 @@ from .protocol import CHAT_WEBSOCKET_URL, CONSENTS_FRAME, SET_OPTIONS_FRAME
 from .utils import drain_json, is_accepted_format, raise_for_status, to_bytes
 
 
+class ClearanceRequired(RuntimeError):
+    """The chat socket demanded a Cloudflare Turnstile token we can't mint here.
+
+    Copilot gates a turn behind a ``challenge`` frame with ``method`` either
+    ``null`` or ``"cloudflare"`` whenever the session's ``cf_clearance`` cookie is
+    stale or missing (confirmed by capturing the real web client: it answers a
+    ``{method:null}`` frame with a ``method:"cloudflare"`` Turnstile token). A
+    Turnstile token can only be produced by executing Cloudflare's challenge JS in
+    a real browser, so the pure-HTTP driver can't satisfy it. The caller should
+    refresh clearance in a browser (see
+    :meth:`copilot.browser.BrowserCopilot.auto_clear`) and retry the turn.
+    """
+
+
 class Copilot(AbstractProvider):
     label = "Microsoft Copilot"
     url = "https://copilot.microsoft.com"
@@ -50,6 +64,7 @@ class Copilot(AbstractProvider):
             return_conversation: bool = False,
             cookies: Dict[str, str] = None,
             access_token: str = None,
+            identity_type: str = None,
             **kwargs
         ):
         """Stream a Copilot reply to ``prompt``.
@@ -96,6 +111,10 @@ class Copilot(AbstractProvider):
         websocket_url = f"{self.websocket_url}&clientSessionId={uuid.uuid4()}"
         if access_token:
             websocket_url = f"{websocket_url}&accessToken={quote(access_token)}"
+            # Federated (Google) tokens ride an extra identity-type marker on the
+            # real client's socket; replay it so the upgrade isn't rejected.
+            if identity_type:
+                websocket_url = f"{websocket_url}&X-UserIdentityType={quote(identity_type)}"
 
         with Session(
             timeout=timeout,
@@ -179,11 +198,27 @@ class Copilot(AbstractProvider):
             for msg in messages:
                 last_msg = msg
                 event = msg.get("event")
-                if event == "challenge" and not answered:
+                if event == "challenge":
+                    method = msg.get("method")
+                    # A Cloudflare Turnstile (method null/"cloudflare") can arrive
+                    # at any point — including *after* a proof-of-work challenge was
+                    # already answered this turn — and we can never mint its token
+                    # here. Surface it regardless of ``answered`` so a stale
+                    # cf_clearance becomes a clean ClearanceRequired instead of a
+                    # silent 60s idle timeout (the frame would otherwise be ignored).
+                    if method in (None, "cloudflare"):
+                        raise ClearanceRequired(
+                            "Copilot chat is gated behind a Cloudflare Turnstile "
+                            f"(challenge method={method!r}); cf_clearance is stale "
+                            "or missing. Refresh clearance in a browser "
+                            "(copilot.browser.BrowserCopilot.auto_clear) and retry."
+                        )
+                    if answered:
+                        continue  # already answered the PoW for this turn; ignore echo
                     token = self._solve_challenge(msg)
                     if token is None:
                         raise RuntimeError(
-                            f"Unsolvable Copilot challenge (method={msg.get('method')!r}). "
+                            f"Unsolvable Copilot challenge (method={method!r}). "
                             "Microsoft may have escalated to a browser-only challenge; "
                             "fall back to copilot.browser.BrowserCopilot."
                         )
@@ -250,20 +285,24 @@ class Copilot(AbstractProvider):
     def _solve_challenge(msg: dict):
         """Return the challenge-response token, or ``None`` if we can't solve it.
 
-        Copilot's chat socket precedes the answer with a challenge frame that the
-        client must acknowledge. An *empty* challenge (no ``method``/``parameter``)
-        only needs an acknowledging response, so we return an empty token; the
-        proof-of-work variants are computed in :mod:`copilot.challenges`. A
-        ``None`` return means the challenge needs a browser-solved token (e.g. a
-        Cloudflare Turnstile) and the caller should surface that.
+        Copilot's chat socket precedes the answer with a challenge frame. The
+        proof-of-work variants (``hashcash``, ``copilot``) are computed in-process
+        (:mod:`copilot.challenges`). A ``None`` return means the challenge needs a
+        browser-solved token and the caller must surface that.
+
+        An *empty* challenge (``method``/``parameter`` both null) is NOT a no-op:
+        capturing the real web client showed it answers ``{method:null}`` with a
+        ``method:"cloudflare"`` Turnstile token. It only appears when
+        ``cf_clearance`` is stale, and curl_cffi can't mint a Turnstile token — so
+        we return ``None`` (the caller raises :class:`ClearanceRequired`). The old
+        "ack an empty challenge with an empty token" behaviour was wrong: it made
+        the socket wait for a token that never came and silently time out.
         """
         method = msg.get("method")
         parameter = msg.get("parameter")
-        if not method and not parameter:
-            return ""  # empty/no-op challenge: just acknowledge it
         if method == "hashcash" and parameter:
             return solve_hashcash(parameter)
         if method == "copilot" and parameter:
             return solve_copilot_challenge(parameter)
-        # 'cloudflare' (Turnstile) / unknown PoW needs a browser-solved token.
+        # method:null / 'cloudflare' (Turnstile) / unknown PoW: browser-only token.
         return None
